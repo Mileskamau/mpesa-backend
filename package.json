@@ -1,6 +1,7 @@
 {
   "name": "mpesa-backend",
   "version": "1.0.0",
+  "description": "M-Pesa Backend API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
