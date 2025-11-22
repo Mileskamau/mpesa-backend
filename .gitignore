@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+new-tkinter-firebase-adminsdk-9yqh4-3f07ad3288.json
 
 # Node.js
 node_modules/
