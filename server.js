@@ -1,36 +1,10 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const admin = require('firebase-admin');
 
-// Only load dotenv in development
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
-
-// Initialize Firebase Admin
-try {
-  // For Railway deployment, use environment variables
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    // Parse service account from environment variable
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-  } else {
-    // For local development, use the JSON file
-    const serviceAccount = require('./firebase-service-account.json');
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-  }
-  console.log('✅ Firebase initialized successfully');
-} catch (error) {
-  console.error('❌ Firebase initialization error:', error);
-}
-
-const db = admin.firestore();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -38,6 +12,9 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// In-memory storage (will reset on server restart)
+const paymentStatus = new Map();
 
 // Sandbox Constants
 const SANDBOX_SHORTCODE = process.env.BUSINESS_SHORTCODE || '174379';
@@ -51,8 +28,9 @@ function getCallbackUrl() {
 // Health check
 app.get('/', (req, res) => {
   res.json({ 
-    message: 'M-Pesa Backend is running!',
-    firebase: 'connected',
+    message: 'M-Pesa Backend is running! 🚀',
+    storage: 'in-memory',
+    firebase: 'disabled',
     timestamp: new Date().toISOString()
   });
 });
@@ -67,6 +45,7 @@ async function getAccessToken() {
     );
     return response.data.access_token;
   } catch (error) {
+    console.error('Access token error:', error.response?.data || error.message);
     throw error;
   }
 }
@@ -75,57 +54,12 @@ function generateTimestamp() {
   return new Date().toISOString().replace(/[^0-9]/g, '').slice(0, -3);
 }
 
-// Save payment to Firebase
-async function savePaymentToFirebase(paymentData) {
-  try {
-    const paymentRef = db.collection('mpesa_payments').doc();
-    
-    const paymentRecord = {
-      id: paymentRef.id,
-      ...paymentData,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    };
-    
-    await paymentRef.set(paymentRecord);
-    
-    console.log('✅ Payment saved to Firebase:', paymentRef.id);
-    return paymentRecord;
-  } catch (error) {
-    console.error('❌ Error saving to Firebase:', error);
-    throw error;
-  }
-}
-
-// Update payment in Firebase
-async function updatePaymentInFirebase(checkoutRequestID, updates) {
-  try {
-    const paymentsRef = db.collection('mpesa_payments');
-    const snapshot = await paymentsRef.where('checkoutRequestID', '==', checkoutRequestID).get();
-    
-    if (snapshot.empty) {
-      console.log('❌ Payment not found in Firebase:', checkoutRequestID);
-      return null;
-    }
-    
-    const doc = snapshot.docs[0];
-    await doc.ref.update({
-      ...updates,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-    
-    console.log('✅ Payment updated in Firebase:', checkoutRequestID);
-    return doc.id;
-  } catch (error) {
-    console.error('❌ Error updating payment in Firebase:', error);
-    throw error;
-  }
-}
-
 // STK Push endpoint
 app.post('/initiate-payment', async (req, res) => {
   try {
     const { phone, amount, accountReference, customerName, customerEmail } = req.body;
+    
+    console.log('💰 Initiating payment:', { phone, amount, accountReference });
     
     const accessToken = await getAccessToken();
     const timestamp = generateTimestamp();
@@ -159,7 +93,7 @@ app.post('/initiate-payment', async (req, res) => {
       }
     );
 
-    // Save initial payment record to Firebase
+    // Store payment in memory
     if (stkResponse.data.CheckoutRequestID) {
       const paymentData = {
         checkoutRequestID: stkResponse.data.CheckoutRequestID,
@@ -174,13 +108,14 @@ app.post('/initiate-payment', async (req, res) => {
         mpesaResponse: stkResponse.data
       };
       
-      await savePaymentToFirebase(paymentData);
+      paymentStatus.set(stkResponse.data.CheckoutRequestID, paymentData);
+      console.log('✅ Payment stored in memory:', stkResponse.data.CheckoutRequestID);
     }
 
     res.json(stkResponse.data);
     
   } catch (error) {
-    console.error('Payment initiation error:', error);
+    console.error('Payment initiation error:', error.response?.data || error.message);
     res.status(500).json({
       error: 'Failed to initiate payment',
       details: error.response?.data || error.message
@@ -188,14 +123,12 @@ app.post('/initiate-payment', async (req, res) => {
   }
 });
 
-// Enhanced Callback endpoint with Firebase
-app.post('/mpesa-callback', async (req, res) => {
+// Callback endpoint
+app.post('/mpesa-callback', (req, res) => {
   console.log('📞 M-Pesa Callback Received');
   
   try {
     const callbackData = req.body;
-    console.log('Callback data received');
-
     const stkCallback = callbackData.Body?.stkCallback;
     
     if (stkCallback) {
@@ -204,43 +137,53 @@ app.post('/mpesa-callback', async (req, res) => {
       const resultDesc = stkCallback.ResultDesc;
       
       console.log('Processing callback for:', checkoutRequestID);
-      console.log('Result Code:', resultCode);
-      console.log('Result Description:', resultDesc);
+      console.log('Result:', resultCode, '-', resultDesc);
 
-      // Prepare update data
-      const updateData = {
-        callbackData: callbackData,
-        resultCode: resultCode,
-        resultDesc: resultDesc,
-        completedAt: new Date().toISOString()
-      };
-
-      if (resultCode === 0) {
-        // Payment successful
-        updateData.status = 'success';
+      // Update payment status
+      if (paymentStatus.has(checkoutRequestID)) {
+        const payment = paymentStatus.get(checkoutRequestID);
         
-        // Extract transaction details
-        const callbackMetadata = stkCallback.CallbackMetadata;
-        if (callbackMetadata && callbackMetadata.Item) {
-          callbackMetadata.Item.forEach(item => {
-            if (item.Name === 'Amount') updateData.amount = item.Value;
-            if (item.Name === 'MpesaReceiptNumber') updateData.mpesaReceiptNumber = item.Value;
-            if (item.Name === 'TransactionDate') updateData.transactionDate = item.Value;
-            if (item.Name === 'PhoneNumber') updateData.phone = item.Value;
+        if (resultCode === 0) {
+          // Payment successful
+          payment.status = 'success';
+          payment.completedAt = new Date().toISOString();
+          
+          // Extract transaction details
+          const callbackMetadata = stkCallback.CallbackMetadata;
+          if (callbackMetadata && callbackMetadata.Item) {
+            callbackMetadata.Item.forEach(item => {
+              if (item.Name === 'Amount') payment.amount = item.Value;
+              if (item.Name === 'MpesaReceiptNumber') payment.mpesaReceiptNumber = item.Value;
+              if (item.Name === 'TransactionDate') payment.transactionDate = item.Value;
+              if (item.Name === 'PhoneNumber') payment.phone = item.Value;
+            });
+          }
+          
+          console.log('🎉 PAYMENT SUCCESSFUL - Receipt:', payment.mpesaReceiptNumber);
+          
+          // Log successful payment (would save to Firebase here)
+          console.log('💾 SUCCESSFUL PAYMENT DATA:', {
+            receipt: payment.mpesaReceiptNumber,
+            amount: payment.amount,
+            phone: payment.phone,
+            accountReference: payment.accountReference,
+            customerName: payment.customerName,
+            customerEmail: payment.customerEmail,
+            timestamp: payment.completedAt
           });
+          
+        } else {
+          // Payment failed
+          payment.status = 'failed';
+          payment.error = resultDesc;
+          payment.completedAt = new Date().toISOString();
+          console.log('❌ PAYMENT FAILED:', resultDesc);
         }
         
-        console.log('✅ PAYMENT SUCCESSFUL - Saving to Firebase');
-        
+        paymentStatus.set(checkoutRequestID, payment);
       } else {
-        // Payment failed
-        updateData.status = 'failed';
-        updateData.error = resultDesc;
-        console.log('❌ PAYMENT FAILED - Updating Firebase');
+        console.log('⚠️ Payment not found in memory:', checkoutRequestID);
       }
-
-      // Update payment in Firebase
-      await updatePaymentInFirebase(checkoutRequestID, updateData);
     }
 
     // Always respond successfully to M-Pesa
@@ -258,61 +201,43 @@ app.post('/mpesa-callback', async (req, res) => {
   }
 });
 
-// Get payment by checkoutRequestID
-app.get('/payment/:checkoutRequestID', async (req, res) => {
+// Get payment status
+app.get('/payment/:checkoutRequestID', (req, res) => {
   try {
     const { checkoutRequestID } = req.params;
     
-    const paymentsRef = db.collection('mpesa_payments');
-    const snapshot = await paymentsRef.where('checkoutRequestID', '==', checkoutRequestID).get();
-    
-    if (snapshot.empty) {
-      return res.status(404).json({
+    if (paymentStatus.has(checkoutRequestID)) {
+      const payment = paymentStatus.get(checkoutRequestID);
+      res.json({
+        status: 'found',
+        payment: payment
+      });
+    } else {
+      res.status(404).json({
         status: 'not_found',
         message: 'Payment not found'
       });
     }
-    
-    const payment = snapshot.docs[0].data();
-    res.json({
-      status: 'found',
-      payment: payment
-    });
-    
   } catch (error) {
-    console.error('Error fetching payment:', error);
     res.status(500).json({
       error: 'Failed to fetch payment'
     });
   }
 });
 
-// Get all payments (with optional filtering)
-app.get('/payments', async (req, res) => {
+// Get all payments
+app.get('/payments', (req, res) => {
   try {
-    const { status, phone, limit = 50 } = req.query;
-    
-    let query = db.collection('mpesa_payments').orderBy('createdAt', 'desc').limit(parseInt(limit));
-    
-    // Apply filters
-    if (status) {
-      query = query.where('status', '==', status);
-    }
-    
-    if (phone) {
-      query = query.where('phone', '==', phone);
-    }
-    
-    const snapshot = await query.get();
-    const payments = snapshot.docs.map(doc => doc.data());
+    const payments = Array.from(paymentStatus.entries()).map(([id, data]) => ({
+      checkoutRequestID: id,
+      ...data
+    }));
     
     res.json({
       total: payments.length,
       payments: payments
     });
-    
   } catch (error) {
-    console.error('Error fetching payments:', error);
     res.status(500).json({
       error: 'Failed to fetch payments'
     });
@@ -320,13 +245,9 @@ app.get('/payments', async (req, res) => {
 });
 
 // Get payment statistics
-app.get('/payment-stats', async (req, res) => {
+app.get('/stats', (req, res) => {
   try {
-    const paymentsRef = db.collection('mpesa_payments');
-    
-    // You might want to add more sophisticated analytics here
-    const snapshot = await paymentsRef.get();
-    const payments = snapshot.docs.map(doc => doc.data());
+    const payments = Array.from(paymentStatus.values());
     
     const stats = {
       total: payments.length,
@@ -337,17 +258,26 @@ app.get('/payment-stats', async (req, res) => {
     };
     
     res.json(stats);
-    
   } catch (error) {
-    console.error('Error fetching stats:', error);
     res.status(500).json({
       error: 'Failed to fetch statistics'
     });
   }
 });
 
+// Test endpoint
+app.get('/test', (req, res) => {
+  res.json({ 
+    message: 'Test successful!',
+    server: 'running',
+    firebase: 'not-connected',
+    timestamp: new Date().toISOString()
+  });
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📍 Callback URL: ${getCallbackUrl()}`);
-  console.log(`🔥 Firebase: ${admin.apps.length > 0 ? 'Connected' : 'Not connected'}`);
+  console.log(`💾 Storage: In-memory (Firebase disabled)`);
+  console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
