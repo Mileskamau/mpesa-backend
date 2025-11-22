@@ -1,5 +1,0 @@
-[build]
-builder = "nixpacks"
-
-[build.buildCommand]
-command = "npm install"
