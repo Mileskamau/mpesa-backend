@@ -17,7 +17,7 @@ app.use(express.json());
 const paymentStatus = new Map();
 
 // Sandbox Constants
-const SANDBOX_SHORTCODE = process.env.BUSINESS_SHORTCODE || '174379';
+const SANDBOX_SHORTCODE = process.env.BUSINESS_SHORTCODE || '6944256';
 const SANDBOX_PASSKEY = process.env.MPESA_PASSKEY || 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919';
 const SANDBOX_BASE_URL = 'https://sandbox.safaricom.co.ke';
 
@@ -57,9 +57,9 @@ function generateTimestamp() {
 // STK Push endpoint
 app.post('/initiate-payment', async (req, res) => {
   try {
-    const { phone, amount, accountReference, customerName, customerEmail } = req.body;
+    const { phone, amount, accountReference, eventId, userId } = req.body;
     
-    console.log('💰 Initiating payment:', { phone, amount, accountReference });
+    console.log('💰 Initiating payment:', { phone, amount, accountReference, eventId, userId });
     
     const accessToken = await getAccessToken();
     const timestamp = generateTimestamp();
@@ -101,8 +101,8 @@ app.post('/initiate-payment', async (req, res) => {
         phone: phone,
         amount: amount,
         accountReference: accountReference,
-        customerName: customerName || '',
-        customerEmail: customerEmail || '',
+        eventId: eventId || '',
+        userId: userId || '',
         status: 'pending',
         initiatedAt: new Date().toISOString(),
         mpesaResponse: stkResponse.data
@@ -112,18 +112,76 @@ app.post('/initiate-payment', async (req, res) => {
       console.log('✅ Payment stored in memory:', stkResponse.data.CheckoutRequestID);
     }
 
-    res.json(stkResponse.data);
+    // Return both the M-Pesa response and our transaction ID
+    res.json({
+      ...stkResponse.data,
+      transactionId: stkResponse.data.CheckoutRequestID,
+      success: true
+    });
     
   } catch (error) {
     console.error('Payment initiation error:', error.response?.data || error.message);
     res.status(500).json({
+      success: false,
       error: 'Failed to initiate payment',
       details: error.response?.data || error.message
     });
   }
 });
 
-// Callback endpoint
+// NEW: Payment status endpoint for Flutter app polling
+app.get('/payment-status/:transactionId', (req, res) => {
+  try {
+    const { transactionId } = req.params;
+    
+    console.log('🔍 Checking payment status for:', transactionId);
+    
+    if (paymentStatus.has(transactionId)) {
+      const payment = paymentStatus.get(transactionId);
+      
+      let status, message;
+      
+      switch (payment.status) {
+        case 'success':
+          status = 'completed';
+          message = 'Payment completed successfully';
+          break;
+        case 'failed':
+          status = 'failed';
+          message = payment.error || 'Payment failed or was cancelled';
+          break;
+        case 'pending':
+        default:
+          status = 'pending';
+          message = 'Payment is pending';
+      }
+      
+      res.json({
+        status: status,
+        success: payment.status === 'success',
+        message: message,
+        transactionId: transactionId,
+        payment: payment
+      });
+      
+    } else {
+      res.status(404).json({
+        status: 'not_found',
+        success: false,
+        message: 'Transaction not found'
+      });
+    }
+  } catch (error) {
+    console.error('Payment status error:', error);
+    res.status(500).json({
+      status: 'error',
+      success: false,
+      message: 'Failed to fetch payment status'
+    });
+  }
+});
+
+// Callback endpoint - M-Pesa will call this
 app.post('/mpesa-callback', (req, res) => {
   console.log('📞 M-Pesa Callback Received');
   
@@ -167,10 +225,14 @@ app.post('/mpesa-callback', (req, res) => {
             amount: payment.amount,
             phone: payment.phone,
             accountReference: payment.accountReference,
-            customerName: payment.customerName,
-            customerEmail: payment.customerEmail,
+            eventId: payment.eventId,
+            userId: payment.userId,
             timestamp: payment.completedAt
           });
+          
+          // TODO: Here you would update your database to register the user for the event
+          // This is where you'd connect to Firebase to update the event participants
+          console.log(`✅ USER ${payment.userId} SHOULD BE REGISTERED FOR EVENT ${payment.eventId}`);
           
         } else {
           // Payment failed
@@ -201,7 +263,7 @@ app.post('/mpesa-callback', (req, res) => {
   }
 });
 
-// Get payment status
+// Get payment details by checkoutRequestID
 app.get('/payment/:checkoutRequestID', (req, res) => {
   try {
     const { checkoutRequestID } = req.params;
@@ -280,4 +342,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📍 Callback URL: ${getCallbackUrl()}`);
   console.log(`💾 Storage: In-memory (Firebase disabled)`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🔍 Payment Status Endpoint: GET /payment-status/:transactionId`);
 });
