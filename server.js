@@ -23,8 +23,8 @@ const SANDBOX_PASSKEY = process.env.MPESA_PASSKEY || 'bfb279f9aa9bdbcf158e97dd71
 const SANDBOX_BASE_URL = 'https://sandbox.safaricom.co.ke';
 
 // PayPal Configuration
-const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || 'nejWCxCkiBtGZFyJVqyKSaWw6ZAmrA9jHnLqiaXKUq';
-const PAYPAL_SECRET = process.env.PAYPAL_SECRET || 'E3DvIrhEOpmP6oF_n4f6-b_HH6uFTtyuVfNLU1eZvV';
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
+const PAYPAL_SECRET = process.env.PAYPAL_SECRET || '';
 const PAYPAL_BASE_URL = process.env.PAYPAL_BASE_URL || 'https://api-m.sandbox.paypal.com';
 const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || ''; // For production
 
@@ -248,12 +248,11 @@ app.post('/initiate-payment', async (req, res) => {
 // ================== PAYPAL ENDPOINTS ==================
 
 // Create PayPal order endpoint
+// Create PayPal order endpoint - UPDATED
 app.post('/create-paypal-order', async (req, res) => {
   try {
     const { 
       amount, 
-      currency, 
-      description, 
       eventId, 
       userId, 
       username, 
@@ -261,46 +260,28 @@ app.post('/create-paypal-order', async (req, res) => {
       selectedTeam 
     } = req.body;
     
-    console.log('💰 Creating PayPal order:', { 
+    console.log('💰 Creating PayPal order for:', { 
       amount, 
-      currency, 
       eventId, 
       userId, 
       email 
     });
     
+    // Convert KES to USD
+    const usdAmount = (parseFloat(amount) / 130).toFixed(2);
     const transactionId = `PP${eventId}_${userId}_${Date.now()}`;
-    const usdAmount = (amount / 130).toFixed(2); // Convert KES to USD
     
     const orderData = {
       intent: 'CAPTURE',
       purchase_units: [
         {
           reference_id: transactionId,
-          description: description || 'PUBG Event Payment',
+          description: `PUBG Event: ${eventId}`,
           amount: {
-            currency_code: currency || 'USD',
-            value: usdAmount,
-            breakdown: {
-              item_total: {
-                currency_code: currency || 'USD',
-                value: usdAmount
-              }
-            }
+            currency_code: 'USD',
+            value: usdAmount
           },
-          items: [
-            {
-              name: 'PUBG Event Entry',
-              description: description || 'Event registration fee',
-              quantity: '1',
-              unit_amount: {
-                currency_code: currency || 'USD',
-                value: usdAmount
-              }
-            }
-          ],
-          custom_id: transactionId,
-          invoice_id: transactionId
+          custom_id: transactionId
         }
       ],
       payment_source: {
@@ -328,7 +309,7 @@ app.post('/create-paypal-order', async (req, res) => {
       transactionId: transactionId,
       amount: amount,
       usdAmount: usdAmount,
-      currency: currency || 'USD',
+      currency: 'USD',
       eventId: eventId || '',
       userId: userId || '',
       username: username || '',
@@ -340,22 +321,75 @@ app.post('/create-paypal-order', async (req, res) => {
     };
     
     paypalPayments.set(order.id, paymentData);
-    console.log('✅ PayPal order created:', order.id);
+    console.log('✅ PayPal payment stored:', order.id);
+    
+    // Find approval URL - FIXED LOGIC
+    let approvalUrl = '';
+    console.log('Order links:', order.links);
+    
+    if (order.links && Array.isArray(order.links)) {
+      // Try to find payer-action link first
+      const payerActionLink = order.links.find(link => link.rel === 'payer-action');
+      if (payerActionLink) {
+        approvalUrl = payerActionLink.href;
+        console.log('Found payer-action link:', approvalUrl);
+      } else {
+        // Fallback to approve link
+        const approveLink = order.links.find(link => link.rel === 'approve');
+        if (approveLink) {
+          approvalUrl = approveLink.href;
+          console.log('Found approve link:', approvalUrl);
+        } else {
+          // If no specific link, use the first one that's not self
+          const otherLink = order.links.find(link => link.rel !== 'self');
+          if (otherLink) {
+            approvalUrl = otherLink.href;
+            console.log('Found other link:', approvalUrl);
+          }
+        }
+      }
+    }
+    
+    // Also try to extract from payment_source if available
+    if (!approvalUrl && order.payment_source?.paypal?.links) {
+      const paypalLink = order.payment_source.paypal.links.find(link => link.rel === 'approve');
+      if (paypalLink) {
+        approvalUrl = paypalLink.href;
+      }
+    }
+    
+    // If still no URL, construct a default PayPal checkout URL
+    if (!approvalUrl && order.id) {
+      approvalUrl = `https://www.sandbox.paypal.com/checkoutnow?token=${order.id}`;
+      console.log('Constructed default approval URL:', approvalUrl);
+    }
+    
+    if (!approvalUrl) {
+      console.error('❌ Could not find or construct approval URL');
+      throw new Error('No approval URL available');
+    }
     
     res.json({
       success: true,
       orderId: order.id,
       transactionId: transactionId,
-      approvalUrl: order.links.find(link => link.rel === 'approve')?.href,
-      order: order
+      approvalUrl: approvalUrl,
+      status: order.status,
+      links: order.links, // Include links for debugging
+      message: 'PayPal order created successfully'
     });
     
   } catch (error) {
-    console.error('PayPal order creation error:', error.response?.data || error.message);
+    console.error('❌ Error creating PayPal order:', error.message);
+    
     res.status(500).json({
       success: false,
       error: 'Failed to create PayPal order',
-      details: error.response?.data || error.message
+      details: error.response?.data || error.message,
+      debug: {
+        paypalClientId: PAYPAL_CLIENT_ID ? 'Set' : 'Not set',
+        paypalBaseUrl: PAYPAL_BASE_URL
+      }
     });
   }
 });
