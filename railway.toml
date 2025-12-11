@@ -1,0 +1,5 @@
+[env]
+PAYPAL_CLIENT_ID="ATcl4d6tRpFEFhY2oTLVJ-lvlN7_HLcy8iZJRwMqNVwl-N8KK2k6kh-l9wCvqjE1-s12qtsthCm0nnnC"
+PAYPAL_SECRET="EJPeZWjH3Kr6JuaV6AEwQgs-SYVCZBC8BHdXlCxHvLatmLwNMvOi-wJN54HH2MfJj_RHfP__TqcLap4Q"
+PAYPAL_BASE_URL="https://api-m.sandbox.paypal.com"
+PAYPAL_WEBHOOK_ID="https://mpesa-backend-production-10ca.up.railway.app/paypal/webhook"
